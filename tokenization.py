@@ -3,7 +3,6 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 import unicodedata
 import os
-import spacy
 import re
 import glob
 import codecs
@@ -50,7 +49,8 @@ def text_standardize(text):
     text = text.replace('…', '...')
     text = text.replace('´', "'")
     text = re.sub(
-        r'''(-+|~+|!+|"+|;+|\?+|\++|,+|\)+|\(+|\\+|\/+|\*+|\[+|\]+|}+|{+|\|+|_+)''', r' \1 ', text)
+        r'''(-+|~+|!+|"+|;+|\?+|\++|,+|\)+|\(+|\\+|\/+|\*+|\[+|\]+|}+|{+|\|+|_+)''',
+        r' \1 ', text)
     text = re.sub(r'\s*\n\s*', ' \n ', text)
     text = re.sub(r'[^\S\n]+', ' ', text)
     return text.strip()
@@ -147,13 +147,13 @@ class BasicTokenizer(object):
         # space-separated words, so they are not treated specially and handled
         # like the all of the other languages.
         if ((cp >= 0x4E00 and cp <= 0x9FFF) or  #
-                (cp >= 0x3400 and cp <= 0x4DBF) or  #
-                (cp >= 0x20000 and cp <= 0x2A6DF) or  #
-                (cp >= 0x2A700 and cp <= 0x2B73F) or  #
-                (cp >= 0x2B740 and cp <= 0x2B81F) or  #
-                (cp >= 0x2B820 and cp <= 0x2CEAF) or
-                (cp >= 0xF900 and cp <= 0xFAFF) or  #
-                (cp >= 0x2F800 and cp <= 0x2FA1F)):  #
+            (cp >= 0x3400 and cp <= 0x4DBF) or  #
+            (cp >= 0x20000 and cp <= 0x2A6DF) or  #
+            (cp >= 0x2A700 and cp <= 0x2B73F) or  #
+            (cp >= 0x2B740 and cp <= 0x2B81F) or  #
+            (cp >= 0x2B820 and cp <= 0x2CEAF) or
+            (cp >= 0xF900 and cp <= 0xFAFF) or  #
+            (cp >= 0x2F800 and cp <= 0x2FA1F)):  #
             return True
 
         return False
@@ -240,12 +240,12 @@ class Tokenizer(object):
         支持basic，word_piece，spacy（多种语言https://spacy.io/usage/models#languages）等多种分词方式，构建词汇表。
     """
 
-    def __init__(self, split_type='basic', do_lower_case=True, vocab_file=None,  max_len=None,
+    def __init__(self,
+                 split_type='basic',
+                 do_lower_case=True,
+                 bert_vocab_file=None,
+                 max_len=None,
                  never_split=("<UNK>", "<EOS>", '<S>', "<SEP>", "<PAD>")):
-        # tokenizer type : base, word_piece, [spacy]:https://spacy.io/usage/models#languages
-        # token2str
-        # id2str
-        # build_vocab
         """Constructs a Tokenizer.
 
         Args:
@@ -254,7 +254,7 @@ class Tokenizer(object):
                 'word_piece' ——  使用词片分词，使用BERT预训练模型提供的vocabulary作为基词汇表。
                 '<spacy code>' —— 使用spacy后端分词，支持多种语言，需要提供具体语言的spacy code，例如：'en'为英文,'zh'为中文...具体参见：https://spacy.io/usage/models#languages
             do_lower_case: Whether to lower case the input
-            vocab_file: Path to a one-wordpiece-per-line vocabulary file.
+            bert_vocab_file: Path to a one-wordpiece-per-line vocabulary file.
                         Only has an effect when type='word_piece'.
             max_len: An artificial maximum length to truncate tokenized sequences to;
                          Effective maximum length is always the minimum of this
@@ -264,21 +264,22 @@ class Tokenizer(object):
         """
         self.split_type = split_type
         if split_type == 'basic':
-            self.basic_tokenizer = BasicTokenizer(
-                do_lower_case=True, never_split=never_split)
+            self.basic_tokenizer = BasicTokenizer(do_lower_case=True,
+                                                  never_split=never_split)
         elif split_type == 'word_piece':
-            assert vocab_file and os.path.exists(vocab_file), \
+            assert bert_vocab_file and os.path.exists(bert_vocab_file), \
                 "To use 'word_piece' split type, you need to specify the correct BERT pre-trained vocabulary file path."
-            self.basic_tokenizer = BasicTokenizer(
-                do_lower_case=True, never_split=never_split)
+            self.basic_tokenizer = BasicTokenizer(do_lower_case=True,
+                                                  never_split=never_split)
             # 加载bert预训练vocab
-            bert_vocab = load_vocab(vocab_file)
+            bert_vocab = load_vocab(bert_vocab_file)
             self.wordpiece_tokenizer = WordpieceTokenizer(
                 bert_vocab, unk_token="<UNK>", max_input_chars_per_word=100)
         else:
             # 这里记得加入 assert 判断是否是spacy支持的字段
             assert split_type in [
-                'en', 'zh'], "the split_type %s cannot be resolved." % (split_type)
+                'en', 'zh'
+            ], "the split_type %s cannot be resolved." % (split_type)
             import ftfy
             import spacy
             self.sapcy_tokenizer = spacy.blank(split_type)
@@ -304,8 +305,7 @@ class Tokenizer(object):
                 for sub_token in self.wordpiece_tokenizer.tokenize(token):
                     split_tokens.append(sub_token)
         else:
-            doc = self.sapcy_tokenizer(
-                text_standardize(self.fix_text(text)))
+            doc = self.sapcy_tokenizer(text_standardize(self.fix_text(text)))
             split_tokens = [str(t) for t in doc]
         if add_double_eos:
             return ['<S>'] + split_tokens + ['<S>']
@@ -314,7 +314,12 @@ class Tokenizer(object):
         else:
             return split_tokens
 
-    def tokenize_batch(self, text_list, add_eos=False, add_double_eos=False, batch_size=512, n_threads=3):
+    def tokenize_batch(self,
+                       text_list,
+                       add_eos=False,
+                       add_double_eos=False,
+                       batch_size=512,
+                       n_threads=3):
         '''Segment the batch of text into list of tokens.
             Input: 
                 text_list —— list of string. etc. ['this is text1', 'this is text2', ...]
@@ -324,30 +329,40 @@ class Tokenizer(object):
         texts_token = []
         if self.split_type == 'basic' or self.split_type == 'word_piece':
             for text in text_list:
-                texts_token.append(self.tokenize(
-                    text, add_eos, add_double_eos))
+                texts_token.append(self.tokenize(text, add_eos,
+                                                 add_double_eos))
         else:
             if add_double_eos:
-                for doc in self.sapcy_tokenizer.pipe(text_list, batch_size=batch_size, n_threads=n_threads):
+                for doc in self.sapcy_tokenizer.pipe(text_list,
+                                                     batch_size=batch_size,
+                                                     n_threads=n_threads):
                     texts_token.append(['<S>'] + [str(t)
                                                   for t in doc] + ['<S>'])
             elif add_eos:
-                for doc in self.sapcy_tokenizer.pipe(text_list, batch_size=batch_size, n_threads=n_threads):
-                    texts_token.append([str(t) for t in doc]+['<EOS>'])
+                for doc in self.sapcy_tokenizer.pipe(text_list,
+                                                     batch_size=batch_size,
+                                                     n_threads=n_threads):
+                    texts_token.append([str(t) for t in doc] + ['<EOS>'])
             else:
-                for doc in self.sapcy_tokenizer.pipe(text_list, batch_size=batch_size, n_threads=n_threads):
+                for doc in self.sapcy_tokenizer.pipe(text_list,
+                                                     batch_size=batch_size,
+                                                     n_threads=n_threads):
                     texts_token.append([str(t) for t in doc])
 
         return texts_token
 
-    def build_vocab(self, corpus_path, min_freq=0, max_size=None, file_suffix='txt'):
+    def build_vocab(self,
+                    corpus_path,
+                    min_freq=0,
+                    max_size=None,
+                    file_suffix='txt'):
         logger.info("building vocab...")
         file_list = []
         if os.path.isdir(corpus_path):
             logger.info("corpus path is a directory")
             # 获取目录下所有'.txt'文件路径
-            file_list = glob.glob(os.path.join(
-                corpus_path, '*.%s' % file_suffix))
+            file_list = glob.glob(
+                os.path.join(corpus_path, '*.%s' % file_suffix))
         elif os.path.isfile(corpus_path):
             logger.info("corpus path is a normal file")
             file_list.append(corpus_path)
@@ -413,14 +428,16 @@ class Tokenizer(object):
             return None
         ids = []
         for token in tokens:
-            ids.append(self.tkn2idx[token])
+            if token in self.tkn2idx:
+                ids.append(self.tkn2idx[token])
+            else:
+                ids.append(self.tkn2idx["<UNK>"])
         if len(ids) > self.max_len:
             logger.warning(
                 "Token indices sequence length is longer than the specified maximum "
                 " sequence length for this model ({} > {}). Running this"
                 " sequence through will result in indexing errors".format(
-                    len(ids), self.max_len)
-            )
+                    len(ids), self.max_len))
         return ids
 
     def convert_ids_to_tokens(self, ids):
@@ -430,7 +447,10 @@ class Tokenizer(object):
             return None
         tokens = []
         for i in ids:
-            tokens.append(self.vocab[i])
+            if i >=0 and i < len(self.vocab):
+                tokens.append(self.vocab[i])
+            else:
+                tokens.append("<UNK>")
         return tokens
 
 
@@ -465,8 +485,8 @@ def _is_punctuation(char):
     # Characters such as "^", "$", and "`" are not in the Unicode
     # Punctuation class but we treat them as punctuation anyways, for
     # consistency.
-    if ((cp >= 33 and cp <= 47) or (cp >= 58 and cp <= 64) or
-            (cp >= 91 and cp <= 96) or (cp >= 123 and cp <= 126)):
+    if ((cp >= 33 and cp <= 47) or (cp >= 58 and cp <= 64)
+            or (cp >= 91 and cp <= 96) or (cp >= 123 and cp <= 126)):
         return True
     cat = unicodedata.category(char)
     if cat.startswith("P"):
