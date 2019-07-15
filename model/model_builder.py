@@ -6,7 +6,7 @@ import re
 import torch
 import torch.nn as nn
 from torch.nn.init import xavier_uniform_
-
+from model.transformer import TransformerEncoder, TransformerDecoder, TransformerModel
 # import onmt.inputters as inputters
 import onmt.modules
 # from onmt.encoders import str2enc
@@ -48,30 +48,6 @@ def build_embeddings(opt, tokenizer, for_encoder=True):
     )
     return emb
 
-
-def build_encoder(opt, embeddings):
-    """
-    Various encoder dispatcher function.
-    Args:
-        opt: the option in current environment.
-        embeddings (Embeddings): vocab embeddings for this encoder.
-    """
-    enc_type = opt.encoder_type if opt.model_type == "text" else opt.model_type
-    return str2enc[enc_type].from_opt(opt, embeddings)
-
-
-def build_decoder(opt, embeddings):
-    """
-    Various decoder dispatcher function.
-    Args:
-        opt: the option in current environment.
-        embeddings (Embeddings): vocab embeddings for this decoder.
-    """
-    dec_type = "ifrnn" if opt.decoder_type == "rnn" and opt.input_feed \
-               else opt.decoder_type
-    return str2dec[dec_type].from_opt(opt, embeddings)
-
-
 def load_test_model(opt, model_path=None):
     if model_path is None:
         model_path = opt.models[0]
@@ -98,7 +74,7 @@ def load_test_model(opt, model_path=None):
     return fields, model, model_opt
 
 
-def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
+def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
     """Build a model from opts.
 
     Args:
@@ -106,6 +82,8 @@ def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
             the opts have been updated and validated. See
             :class:`onmt.utils.parse.ArgumentParser`.
         gpu (bool): whether to use gpu.
+        tokenizer: tokenizer used to build embedding layer, if opt.share_tokenizer = true
+                   tokenizer is a EasyTokenizer instance else is a dice contain {'src','tgt'}.
         checkpoint: the model gnerated by train phase, or a resumed snapshot
                     model from a stopped training.
         gpu_id (int or NoneType): Which GPU to use.
@@ -114,47 +92,42 @@ def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
         the NMTModel.
     """
 
-    # Build embeddings.
-    # 需要修改，传参tokenizer
-    src_emb = build_embeddings(model_opt, src_field)
-
+    # Build source embeddings.
+    if opt.share_tokenizer:
+        src_emb = build_embeddings(model_opt, tokenizer, src_field)
+    else:
+        src_emb = build_embeddings(model_opt, tokenizer['src'], src_field)
     # Build encoder.
-    encoder = build_encoder(model_opt, src_emb)
+    encoder = TransformerEncoder.from_opt(model_opt, src_emb)
 
-    # Build decoder.
-    tgt_field = fields["tgt"]
-    tgt_emb = build_embeddings(model_opt, tgt_field, for_encoder=False)
-
+    # Build target embeddings.
+    if opt.share_tokenizer:
+        tgt_emb = build_embeddings(model_opt, tokenizer, for_encoder=False)
+    else:
+        tgt_emb = build_embeddings(model_opt, tokenizer['tgt'], for_encoder=False)
     # Share the embedding matrix - preprocess with share_vocab required.
     if model_opt.share_embeddings:
-        # src/tgt vocab should be the same if `-share_vocab` is specified.
-        assert src_field.base_field.vocab == tgt_field.base_field.vocab, \
-            "preprocess with -share_vocab if you use share_embeddings"
-
+        if not opt.share_tokenizer:
+            # src/tgt vocab should be the same if `-share_vocab` is specified.
+            assert src_field.base_field.vocab == tgt_field.base_field.vocab, \
+                "preprocess with -share_vocab if you use share_embeddings"
         tgt_emb.word_lut.weight = src_emb.word_lut.weight
+    # Build decoder.
+    decoder = TransformerDecoder.from_opt(model_opt, src_emb)
 
-    decoder = build_decoder(model_opt, tgt_emb)
-
-    # Build NMTModel(= encoder + decoder).
-    if gpu and gpu_id is not None:
-        device = torch.device("cuda", gpu_id)
-    elif gpu and not gpu_id:
-        device = torch.device("cuda")
-    elif not gpu:
-        device = torch.device("cpu")
-    # 构建模型主体
-    model = onmt.models.NMTModel(encoder, decoder)
+    # Build TransformerModel(= encoder + decoder).
+    model = TransformerModel(encoder, decoder)
 
     # Build Generator.
     # copy attention 是另一个论文提出的技术
     if not model_opt.copy_attn:
         if model_opt.generator_function == "sparsemax":
-            gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+            gen_func = model.modules.sparse_activations.LogSparsemax(dim=-1)
         else:
             gen_func = nn.LogSoftmax(dim=-1)
         generator = nn.Sequential(
-            nn.Linear(model_opt.dec_rnn_size,
-                      len(fields["tgt"].base_field.vocab)),
+            nn.Linear(model_opt.dec_dim_size,
+                      len(tokenizer.vocal) if opt.share_tokenizer else len(tokenizer['tgt'].vocab)),
             Cast(torch.float32),
             gen_func
         )
@@ -164,7 +137,7 @@ def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
         tgt_base_field = fields["tgt"].base_field
         vocab_size = len(tgt_base_field.vocab)
         pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
-        generator = CopyGenerator(model_opt.dec_rnn_size, vocab_size, pad_idx)
+        generator = CopyGenerator(model_opt.dec_dim_size, vocab_size, pad_idx)
 
     # Load the model states from checkpoint or initialize them.
     if checkpoint is not None:
@@ -206,6 +179,13 @@ def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
                 model_opt.pre_word_vecs_dec)
     # 生成部分
     model.generator = generator
+
+    if gpu and gpu_id is not None:
+        device = torch.device("cuda", gpu_id)
+    elif gpu and not gpu_id:
+        device = torch.device("cuda")
+    elif not gpu:
+        device = torch.device("cpu")
     model.to(device)
     if model_opt.model_dtype == 'fp16':
         model.half()00000000000000
@@ -213,12 +193,12 @@ def build_base_model(model_opt, gpu, checkpoint=None, gpu_id=None):
     return model
 
 
-def build_model(model_opt, opt, checkpoint):
+def build_model(model_opt, opt, tokenizer, checkpoint):
     logger.info('Building model...')
     gpu_id = None
     if len(opt.gpus) != 0:
         # use the first GPU in given list.
         gpu_id = opt.gpus[0]
-    model = build_base_model(model_opt, opt.use_gpu, checkpoint, gpu_id=gpu_id)
+    model = build_base_model(model_opt, opt.use_gpu, tokenizer, checkpoint, gpu_id=gpu_id)
     logger.info(model)
     return model
