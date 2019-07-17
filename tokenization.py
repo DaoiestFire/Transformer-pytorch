@@ -61,7 +61,7 @@ class BasicTokenizer(object):
 
     def __init__(self,
                  do_lower_case=True,
-                 never_split=("<UNK>", "<EOS>", '<S>', "<SEP>", "<PAD>")):
+                 never_split=("<PAD>", "<UNK>", "<EOS>", "<S>")):
         """Constructs a BasicTokenizer.
 
         Args:
@@ -245,7 +245,7 @@ class Tokenizer(object):
                  do_lower_case=True,
                  bert_vocab_file=None,
                  max_len=None,
-                 never_split=("<UNK>", "<EOS>", '<S>', "<SEP>", "<PAD>")):
+                 never_split=("<PAD>", "<UNK>", "<EOS>", "<S>")):
         """Constructs a Tokenizer.
 
         Args:
@@ -289,7 +289,7 @@ class Tokenizer(object):
         self.never_split = never_split
         self.max_len = max_len if max_len is not None else int(1e12)
 
-    def tokenize(self, text, add_eos=False, add_double_eos=False):
+    def tokenize(self, text, add_eos=True, add_double_eos=False):
         '''Segment the text into list of tokens.
             Input: 
                 text —— single text of string.
@@ -453,6 +453,18 @@ class Tokenizer(object):
                 tokens.append("<UNK>")
         return tokens
 
+    def pad(self, src, length):
+        """
+        padding word index sequeence
+            src (list): the out put of "convert_tokens_to_ids". [1,2,3,4,5]
+            length (int): the target length, if the length of src is longer
+                        than target length, it will be truncated.
+        """
+        if len(src) > length:
+            src = src[:length-1].append(src[-1])
+        else:
+            src.extend([0 for i in range(length-len(src))])
+        return src
 
 def _is_whitespace(char):
     """Checks whether `chars` is a whitespace character."""

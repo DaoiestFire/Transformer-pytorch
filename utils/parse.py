@@ -3,7 +3,7 @@ import os
 
 import torch
 
-import onmt.opts as opts
+import opts as opts
 from utils.logging import logger
 
 

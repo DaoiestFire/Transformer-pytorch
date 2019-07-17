@@ -15,57 +15,53 @@ import itertools
 import torch
 # 异常栈跟踪
 import traceback
-
-import onmt.utils
+from utils.earlystopping import EarlyStopping, scorers_from_opts
+from utils.report_manager import build_report_manager
 from utils.logging import logger
+from model.loss import build_loss_compute
 
-
-def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
+def build_trainer(opt, device_id, model, tgt_tokenizer, optim, model_saver=None):
     """
     Simplify `Trainer` creation based on user `opt`s*
 
     Args:
         opt (:obj:`Namespace`): user options (usually from argument parsing)
-        model (:obj:`onmt.models.NMTModel`): the model to train
-        fields (dict): dict of fields
-        optim (:obj:`onmt.utils.Optimizer`): optimizer used during training
-        data_type (str): string describing the type of data
-            e.g. "text", "img", "audio"
-        model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
+        model : the model to train
+        tgt_tokenizer (EasyTokenizer): Target tokenizer.
+        optim (:obj:`model.Optimizer`): optimizer used during training
+        model_saver(:obj:`model.ModelSaverBase`): the utility object
             used to save the model
     """
 
-    tgt_field = dict(fields)["tgt"].base_field
-    train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
-    valid_loss = onmt.utils.loss.build_loss_compute(
-        model, tgt_field, opt, train=False)
+    train_loss = build_loss_compute(model, tgt_tokenizer, opt)
+    valid_loss = build_loss_compute(model, tgt_tokenizer, opt, train=False)
 
     trunc_size = opt.truncated_decoder  # Badly named...
     shard_size = opt.max_generator_batches if opt.model_dtype == 'fp32' else 0
     norm_method = opt.normalization
     accum_count = opt.accum_count
     accum_steps = opt.accum_steps
-    n_gpu = opt.world_size
+    # n_gpu = opt.world_size
     average_decay = opt.average_decay
     average_every = opt.average_every
     dropout = opt.dropout
     dropout_steps = opt.dropout_steps
-    if device_id >= 0:
-        gpu_rank = opt.gpu_ranks[device_id]
-    else:
-        gpu_rank = 0
-        n_gpu = 0
+    # if device_id >= 0:
+    #     gpu_rank = opt.gpu_ranks[device_id]
+    # else:
+    #     gpu_rank = 0
+    #     n_gpu = 0
     gpu_verbose_level = opt.gpu_verbose_level
 
-    earlystopper = onmt.utils.EarlyStopping(
-        opt.early_stopping, scorers=onmt.utils.scorers_from_opts(opt)) \
+    earlystopper = EarlyStopping(
+        opt.early_stopping, scorers=scorers_from_opts(opt)) \
         if opt.early_stopping > 0 else None
 
-    report_manager = onmt.utils.build_report_manager(opt)
-    trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
+    report_manager = build_report_manager(opt)
+    trainer = Trainer(model, train_loss, valid_loss, optim, trunc_size,
                            shard_size, norm_method,
                            accum_count, accum_steps,
-                           n_gpu, gpu_rank,
+                        #    n_gpu, gpu_rank,
                            gpu_verbose_level, report_manager,
                            model_saver=model_saver if gpu_rank == 0 else None,
                            average_decay=average_decay,

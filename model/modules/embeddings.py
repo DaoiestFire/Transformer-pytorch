@@ -251,6 +251,7 @@ class Embeddings(nn.Module):
                     source = module(source, step=step)
                 else:
                     source = module(source)
+                print('source.size:',source.size())
         else:
             source = self.make_embedding(source)
 

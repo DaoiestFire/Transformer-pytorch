@@ -102,12 +102,11 @@ class TransformerEncoder(nn.Module):
         """Alternate constructor."""
         return cls(
             opt.enc_layers,
-            opt.enc_rnn_size,
+            opt.enc_dim_size,
             opt.heads,
             opt.transformer_ff,
             opt.dropout[0] if type(opt.dropout) is list else opt.dropout,
-            embeddings,
-            opt.max_relative_positions)
+            embeddings)
 
     def forward(self, src, lengths=None):
         """See :func:`EncoderBase.forward()`"""
@@ -116,7 +115,8 @@ class TransformerEncoder(nn.Module):
         emb = self.embeddings(src)
 
         out = emb.transpose(0, 1).contiguous()
-        words = src[:, :, 0].transpose(0, 1)
+        words = src.transpose(0, 1)
+        print('words.size:',words.size())
         # w_batch, w_len = words.size()
         padding_idx = self.embeddings.word_padding_idx
         mask = words.data.eq(padding_idx).unsqueeze(1)  # [B, 1, T]
@@ -131,7 +131,6 @@ class TransformerEncoder(nn.Module):
         self.embeddings.update_dropout(dropout)
         for layer in self.transformer:
             layer.update_dropout(dropout)
-
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -187,6 +186,7 @@ class TransformerDecoderLayer(nn.Module):
                 device=tgt_pad_mask.device,
                 dtype=torch.uint8)
             future_mask = future_mask.triu_(1).view(1, tgt_len, tgt_len)
+            # 将两个musk取交集
             dec_mask = torch.gt(tgt_pad_mask + future_mask, 0)
 
         input_norm = self.layer_norm_1(inputs)
@@ -273,14 +273,13 @@ class TransformerDecoder(nn.Module):
         """Alternate constructor."""
         return cls(
             opt.dec_layers,
-            opt.dec_rnn_size,
+            opt.dec_dim_size,
             opt.heads,
             opt.transformer_ff,
             opt.copy_attn,
             opt.self_attn_type,
             opt.dropout[0] if type(opt.dropout) is list else opt.dropout,
-            embeddings,
-            opt.max_relative_positions)
+            embeddings)
 
     def init_state(self, src, memory_bank, enc_hidden):
         """Initialize decoder state."""
@@ -304,20 +303,23 @@ class TransformerDecoder(nn.Module):
         self.state["src"] = self.state["src"].detach()
 
     def forward(self, tgt, memory_bank, step=None, **kwargs):
-        """Decode, possibly stepwise."""
+        """Decode, possibly stepwise.
+        src:[len, batch, 1] word idx
+        """
         if step == 0:
             self._init_cache(memory_bank)
 
         src = self.state["src"]
-        src_words = src[:, :, 0].transpose(0, 1)
-        tgt_words = tgt[:, :, 0].transpose(0, 1)
+        src_words = src.transpose(0, 1)
+        tgt_words = tgt.transpose(0, 1)
         src_batch, src_len = src_words.size()
         tgt_batch, tgt_len = tgt_words.size()
 
         emb = self.embeddings(tgt, step=step)
         assert emb.dim() == 3  # len x batch x embedding_dim
-
+        # output [batch, len, embed_dim]
         output = emb.transpose(0, 1).contiguous()
+        # src_memory_bank [batch, len, model_dim], the output of encoder.
         src_memory_bank = memory_bank.transpose(0, 1).contiguous()
 
         pad_idx = self.embeddings.word_padding_idx
@@ -364,3 +366,46 @@ class TransformerDecoder(nn.Module):
         self.embeddings.update_dropout(dropout)
         for layer in self.transformer_layers:
             layer.update_dropout(dropout)
+
+
+class TransformerModel(nn.Module):
+    """
+    Transformer Model Class
+    """
+    def __init__(self, encoder, decoder):
+        super(TransformerModel, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, tgt, lengths, bptt=False):
+        """Forward propagate a `src` and `tgt` pair for training.
+        Possible initialized with a beginning decoder state.
+
+        Args:
+            src (Tensor): A source sequence passed to encoder.
+                typically for inputs this will be a padded `LongTensor`
+                of size ``(len, batch, features)``. However, may be other 
+                generic input depending on encoder.
+            tgt (LongTensor): A target sequence of size ``(tgt_len, batch)``.
+            lengths(LongTensor): The src lengths, pre-padding ``(batch,)``.
+            bptt (Boolean): A flag indicating if truncated bptt is set.
+                If reset then init_state
+
+        Returns:
+            (FloatTensor, dict[str, FloatTensor]):
+
+            * decoder output ``(tgt_len, batch, hidden)``
+            * dictionary attention dists of ``(tgt_len, batch, src_len)``
+        """
+        tgt = tgt[:-1]  # exclude last target from inputs
+
+        enc_state, memory_bank, lengths = self.encoder(src, lengths)
+        if bptt is False:
+            self.decoder.init_state(src, memory_bank, enc_state)
+        dec_out, attns = self.decoder(tgt, memory_bank,
+                                      memory_lengths=lengths)
+        return dec_out, attns
+
+    def update_dropout(self, dropout):
+        self.encoder.update_dropout(dropout)
+        self.decoder.update_dropout(dropout)

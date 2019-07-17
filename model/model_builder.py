@@ -7,17 +7,24 @@ import torch
 import torch.nn as nn
 from torch.nn.init import xavier_uniform_
 from model.transformer import TransformerEncoder, TransformerDecoder, TransformerModel
-# import onmt.inputters as inputters
-import onmt.modules
-# from onmt.encoders import str2enc
-
-# from onmt.decoders import str2dec
-
+from model.modules.sparse_activations import LogSparsemax
 from model.modules import Embeddings, CopyGenerator
-from onmt.modules.util_class import Cast
-from onmt.utils.misc import use_gpu
-from onmt.utils.logging import logger
-from onmt.utils.parse import ArgumentParser
+from utils.logging import logger
+from utils.parse import ArgumentParser
+
+
+class Cast(nn.Module):
+    """
+    Basic layer that casts its input to a specific data type. The same tensor
+    is returned if the data type is already correct.
+    """
+
+    def __init__(self, dtype):
+        super(Cast, self).__init__()
+        self._dtype = dtype
+
+    def forward(self, x):
+        return x.to(self._dtype)
 
 
 def build_embeddings(opt, tokenizer, for_encoder=True):
@@ -44,9 +51,9 @@ def build_embeddings(opt, tokenizer, for_encoder=True):
         word_padding_idx=word_padding_idx,
         word_vocab_size=num_word_embeddings,
         sparse=opt.optim == "sparseadam",
-        fix_word_vecs=fix_word_vecs
-    )
+        fix_word_vecs=fix_word_vecs)
     return emb
+
 
 def load_test_model(opt, model_path=None):
     if model_path is None:
@@ -57,21 +64,15 @@ def load_test_model(opt, model_path=None):
     model_opt = ArgumentParser.ckpt_model_opts(checkpoint['opt'])
     ArgumentParser.update_model_opts(model_opt)
     ArgumentParser.validate_model_opts(model_opt)
-    vocab = checkpoint['vocab']
-    if inputters.old_style_vocab(vocab):
-        fields = inputters.load_old_vocab(
-            vocab, opt.data_type, dynamic_dict=model_opt.copy_attn
-        )
-    else:
-        fields = vocab
+    tokenizer = checkpoint['tokenizer']
 
-    model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint,
-                             opt.gpu)
+    model = build_base_model(model_opt, opt.use_gpu, tokenizer, checkpoint,
+                             opt.gpu_id)
     if opt.fp32:
         model.float()
     model.eval()
     model.generator.eval()
-    return fields, model, model_opt
+    return tokenizer, model, model_opt
 
 
 def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
@@ -93,23 +94,25 @@ def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
     """
 
     # Build source embeddings.
-    if opt.share_tokenizer:
-        src_emb = build_embeddings(model_opt, tokenizer, src_field)
+    if model_opt.share_tokenizer:
+        src_emb = build_embeddings(model_opt, tokenizer)
     else:
-        src_emb = build_embeddings(model_opt, tokenizer['src'], src_field)
+        src_emb = build_embeddings(model_opt, tokenizer['src'])
     # Build encoder.
     encoder = TransformerEncoder.from_opt(model_opt, src_emb)
 
     # Build target embeddings.
-    if opt.share_tokenizer:
+    if model_opt.share_tokenizer:
         tgt_emb = build_embeddings(model_opt, tokenizer, for_encoder=False)
     else:
-        tgt_emb = build_embeddings(model_opt, tokenizer['tgt'], for_encoder=False)
+        tgt_emb = build_embeddings(model_opt,
+                                   tokenizer['tgt'],
+                                   for_encoder=False)
     # Share the embedding matrix - preprocess with share_vocab required.
     if model_opt.share_embeddings:
-        if not opt.share_tokenizer:
+        if not model_opt.share_tokenizer:
             # src/tgt vocab should be the same if `-share_vocab` is specified.
-            assert src_field.base_field.vocab == tgt_field.base_field.vocab, \
+            assert tokenizer['src'].vocab == tokenizer['tgt'].vocab, \
                 "preprocess with -share_vocab if you use share_embeddings"
         tgt_emb.word_lut.weight = src_emb.word_lut.weight
     # Build decoder.
@@ -122,21 +125,24 @@ def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
     # copy attention 是另一个论文提出的技术
     if not model_opt.copy_attn:
         if model_opt.generator_function == "sparsemax":
-            gen_func = model.modules.sparse_activations.LogSparsemax(dim=-1)
+            gen_func = LogSparsemax(dim=-1)
         else:
             gen_func = nn.LogSoftmax(dim=-1)
         generator = nn.Sequential(
-            nn.Linear(model_opt.dec_dim_size,
-                      len(tokenizer.vocal) if opt.share_tokenizer else len(tokenizer['tgt'].vocab)),
-            Cast(torch.float32),
-            gen_func
-        )
+            nn.Linear(
+                model_opt.dec_dim_size,
+                len(tokenizer.vocab)
+                if model_opt.share_tokenizer else len(tokenizer['tgt'].vocab)),
+            Cast(torch.float32), gen_func)
         if model_opt.share_decoder_embeddings:
             generator[0].weight = decoder.embeddings.word_lut.weight
     else:
-        tgt_base_field = fields["tgt"].base_field
-        vocab_size = len(tgt_base_field.vocab)
-        pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
+        if model_opt.share_tokenizer:
+            vocab_size = len(tokenizer.vocab)
+            pad_idx = tokenizer.PAD_idx
+        else:
+            vocab_size = len(tokenizer['tgt'].vocab)
+            pad_idx = tokenizer['tgt'].PAD_idx
         generator = CopyGenerator(model_opt.dec_dim_size, vocab_size, pad_idx)
 
     # Load the model states from checkpoint or initialize them.
@@ -149,8 +155,10 @@ def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
                        r'\1.layer_norm\2.weight', s)
             return s
 
-        checkpoint['model'] = {fix_key(k): v
-                               for k, v in checkpoint['model'].items()}
+        checkpoint['model'] = {
+            fix_key(k): v
+            for k, v in checkpoint['model'].items()
+        }
         # end of patch for backward compatibility
 
         model.load_state_dict(checkpoint['model'], strict=False)
@@ -179,26 +187,28 @@ def build_base_model(model_opt, gpu, tokenizer, checkpoint=None, gpu_id=None):
                 model_opt.pre_word_vecs_dec)
     # 生成部分
     model.generator = generator
-
-    if gpu and gpu_id is not None:
+    if gpu and (gpu_id is not None):
+        logger.info("use %d GPU." % gpu_id)
         device = torch.device("cuda", gpu_id)
     elif gpu and not gpu_id:
+        logger.info("use default GPU.")
         device = torch.device("cuda")
     elif not gpu:
+        logger.info("use CPU.")
         device = torch.device("cpu")
     model.to(device)
     if model_opt.model_dtype == 'fp16':
-        model.half()00000000000000
+        model.half()
 
     return model
 
 
 def build_model(model_opt, opt, tokenizer, checkpoint):
     logger.info('Building model...')
-    gpu_id = None
-    if len(opt.gpus) != 0:
-        # use the first GPU in given list.
-        gpu_id = opt.gpus[0]
-    model = build_base_model(model_opt, opt.use_gpu, tokenizer, checkpoint, gpu_id=gpu_id)
+    model = build_base_model(model_opt,
+                             opt.use_gpu,
+                             tokenizer,
+                             checkpoint,
+                             gpu_id=opt.gpu_id)
     logger.info(model)
     return model
